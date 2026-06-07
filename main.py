@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from typing import List
 import requests
 
-app = FastAPI(title="RYU Core API", version="10.5.4")
+app = FastAPI(title="RYU Core API", version="10.5.6")
 
 RYU_MASTER_KEY = os.getenv("RYU_API_KEY", "ryu_internal_secure_core_v10")
 api_key_header = APIKeyHeader(name="X-RYU-Token", auto_error=True)
@@ -42,32 +42,44 @@ def route_to_gemini_native(messages: list) -> str:
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing API Key.")
     
-    # Extract the system prompt cleanly if it exists, or provide a default
-    system_instruction = "You are a helpful assistant."
+    # Baseline fallback system instructions
+    system_text = "You are a helpful assistant."
     contents = []
     
     for msg in messages:
-        if msg["role"] == "system":
-            system_instruction = msg["content"]
-        else:
-            # Native Gemini endpoints only accept 'user' and 'model'
-            role_map = "user" if msg["role"] == "user" else "model"
-            contents.append({
-                "role": role_map,
-                "parts": [{"text": msg["content"]}]
-            })
+        if not msg.get("content") or str(msg["content"]).strip() == "":
+            continue
             
-    # If the history slice doesn't have a user message yet, append an empty one to satisfy API specs
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            # Map roles explicitly to the strict native schema
+            role_map = "user" if msg["role"] in ["user", "YOU"] else "model"
+            
+            # Collapse adjacent same-role blocks to preserve alternating balance
+            if contents and contents[-1]["role"] == role_map:
+                contents[-1]["parts"][0]["text"] += f"\n{msg['content']}"
+            else:
+                contents.append({
+                    "role": role_map,
+                    "parts": [{"text": msg["content"]}]
+                })
+                
+    # Balance entry point structure
+    if contents and contents[0]["role"] == "model":
+        contents.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
+        
     if not contents:
         contents.append({"role": "user", "parts": [{"text": "Hello"}]})
         
     url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){api_key}"
     headers = {"Content-Type": "application/json"}
     
+    # Correct REST API layout mapping for systemInstructions
     payload = {
         "contents": contents,
         "systemInstruction": {
-            "parts": [{"text": system_instruction}]
+            "parts": {"text": system_text}
         },
         "generationConfig": {
             "temperature": 0.6,
@@ -81,9 +93,10 @@ def route_to_gemini_native(messages: list) -> str:
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
-            raise HTTPException(status_code=500, detail="Parsing failure.")
+            raise HTTPException(status_code=500, detail="Parsing failed on output payload structure.")
     else:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
+        # Pass backend response error details straight through to find out exactly why it failed
+        raise HTTPException(status_code=response.status_code, detail=f"Google API Error: {response.text}")
 
 @app.post("/v1/chat/generate", dependencies=[Depends(verify_token)])
 async def generate_response(payload: Payload):
@@ -94,3 +107,4 @@ async def generate_response(payload: Payload):
         return {"status": "success", "response": cleaned_response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
